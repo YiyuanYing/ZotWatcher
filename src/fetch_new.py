@@ -10,6 +10,8 @@ from typing import List
 
 import feedparser
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .models import CandidateWork
 from .settings import Settings
@@ -17,11 +19,31 @@ from .utils import ensure_isoformat, iso_to_datetime, utc_now
 
 logger = logging.getLogger(__name__)
 
+_RETRY_TOTAL = 3
+_RETRY_BACKOFF = 2  # seconds; actual wait = backoff_factor * (2 ** (attempt - 1))
+_RETRY_STATUS_CODES = (429, 500, 502, 503, 504)
+
+
+def _build_session() -> requests.Session:
+    """Return a requests Session with retry + backoff configured."""
+    session = requests.Session()
+    retry = Retry(
+        total=_RETRY_TOTAL,
+        backoff_factor=_RETRY_BACKOFF,
+        status_forcelist=_RETRY_STATUS_CODES,
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
 
 class CandidateFetcher:
     def __init__(self, settings: Settings, base_dir: Path):
         self.settings = settings
-        self.session = requests.Session()
+        self.session = _build_session()
         self.base_dir = Path(base_dir)
         self.cache_path = self.base_dir / "data" / "cache" / "candidate_cache.json"
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -49,16 +71,34 @@ class CandidateFetcher:
         results: List[CandidateWork] = []
 
         if self.settings.sources.openalex.enabled:
-            results.extend(self._fetch_openalex(since))
+            try:
+                results.extend(self._fetch_openalex(since))
+            except Exception as exc:
+                logger.warning("Failed to fetch OpenAlex works: %s", exc)
         if self.settings.sources.crossref.enabled:
-            results.extend(self._fetch_crossref(since))
-            results.extend(self._fetch_crossref_top_venues(since))
+            try:
+                results.extend(self._fetch_crossref(since))
+            except Exception as exc:
+                logger.warning("Failed to fetch Crossref works: %s", exc)
+            try:
+                results.extend(self._fetch_crossref_top_venues(since))
+            except Exception as exc:
+                logger.warning("Failed to fetch Crossref top-venue works: %s", exc)
         if self.settings.sources.arxiv.enabled:
-            results.extend(self._fetch_arxiv())
+            try:
+                results.extend(self._fetch_arxiv())
+            except Exception as exc:
+                logger.warning("Failed to fetch arXiv works: %s", exc)
         if self.settings.sources.biorxiv.enabled:
-            results.extend(self._fetch_biorxiv(window_days))
+            try:
+                results.extend(self._fetch_biorxiv(window_days))
+            except Exception as exc:
+                logger.warning("Failed to fetch bioRxiv works: %s", exc)
         if self.settings.sources.medrxiv.enabled:
-            results.extend(self._fetch_biorxiv(window_days, medrxiv=True))
+            try:
+                results.extend(self._fetch_biorxiv(window_days, medrxiv=True))
+            except Exception as exc:
+                logger.warning("Failed to fetch medRxiv works: %s", exc)
 
         logger.info("Fetched %d candidate works", len(results))
         self._save_cache(results)
@@ -294,7 +334,7 @@ class CandidateFetcher:
         from_date = to_date - timedelta(days=window_days)
         url = f"https://api.biorxiv.org/details/{base}/{from_date:%Y-%m-%d}/{to_date:%Y-%m-%d}"
         logger.info("Fetching %s preprints from %s to %s", base, from_date.date(), to_date.date())
-        resp = self.session.get(url, timeout=30)
+        resp = self.session.get(url, timeout=60)
         resp.raise_for_status()
         data = resp.json()
         results = []
